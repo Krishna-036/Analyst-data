@@ -30,7 +30,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 # ---------------------------------------------------------------- config
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-MODEL = os.environ.get("MODEL", "gemini-1.5-pro")
+MODEL = os.environ.get("MODEL", "gemini-2.0-flash")
 MODEL_BASE_URL = os.environ.get("MODEL_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
 BASE_URL = os.environ.get("BASE_URL", "https://analyst-data-4.onrender.com").rstrip("/")
 LOG_PATH = os.environ.get("LOG_PATH", "/tmp/run.jsonl")
@@ -128,7 +128,8 @@ def chat_completion(messages, use_tools=True):
         json=body,
         timeout=180,
     )
-    r.raise_for_status()
+    if not r.ok:
+        raise Exception(f"HTTP {r.status_code}: {r.text}")
     return r.json()["choices"][0]["message"]
 
 
