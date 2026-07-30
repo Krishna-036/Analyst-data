@@ -1,2 +1,0 @@
-
-os.system("git add run.jsonl && git commit -m log &&  git push")
