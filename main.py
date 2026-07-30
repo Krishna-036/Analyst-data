@@ -131,4 +131,4 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 @app.on_event("startup")
 def on_startup():
     """Automatically registers the webhook on deployment."""
-    requests.get(f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/setWebhook?url={HOST_URL}/webhook")
+    requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={HOST_URL}/webhook")
