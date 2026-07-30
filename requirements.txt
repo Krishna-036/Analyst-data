@@ -3,4 +3,5 @@ uvicorn
 requests
 pandas
 numpy
-pip install python-telegram-bot openai
+telegram-bot 
+openai
