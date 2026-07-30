@@ -3,6 +3,4 @@ uvicorn
 requests
 pandas
 numpy
-beautifulsoup4
-lxml
-openpyxl
+pip install python-telegram-bot openai
