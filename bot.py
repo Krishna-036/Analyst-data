@@ -30,9 +30,9 @@ from fastapi.responses import FileResponse, PlainTextResponse
 # ---------------------------------------------------------------- config
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-MODEL = os.environ.get("MODEL", "gemini-2.0-flash")
-MODEL_BASE_URL = os.environ.get("MODEL_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
-BASE_URL = os.environ.get("BASE_URL", "https://analyst-data-4.onrender.com").rstrip("/")
+MODEL = os.environ.get("MODEL", "gpt-4o-mini")
+MODEL_BASE_URL = os.environ.get("MODEL_BASE_URL", "https://aipipe.org/openai/v1")
+BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 LOG_PATH = os.environ.get("LOG_PATH", "/tmp/run.jsonl")
 LOG_URL = f"{BASE_URL}/run.jsonl"
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -128,8 +128,7 @@ def chat_completion(messages, use_tools=True):
         json=body,
         timeout=180,
     )
-    if not r.ok:
-        raise Exception(f"HTTP {r.status_code}: {r.text}")
+    r.raise_for_status()
     return r.json()["choices"][0]["message"]
 
 
