@@ -46,8 +46,8 @@ def process_message(chat_id: int, text: str):
     
     # 2. Heuristic: Wait for the final instruction before running analysis
     # If the user is just passing multi-turn context and not asking for the final JSON, skip replying.
-    if "{" not in text and "json" not in text.lower():
-        return
+   # if "{" not in text and "json" not in text.lower():
+   #     return
 
     # 3. Agent Loop with Tool Calling
     messages = chat_histories[chat_id].copy()
