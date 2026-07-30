@@ -1,6 +1,8 @@
 fastapi
 uvicorn
-requests
-openai
+httpx
 pandas
-python-dotenv
+duckdb
+openai
+pydantic
+google-genai
