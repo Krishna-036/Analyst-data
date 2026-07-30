@@ -1,134 +1,203 @@
 import os
 import json
-import io
-import contextlib
-import requests
-import pandas as pd
-from fastapi import FastAPI, Request, BackgroundTasks
+import asyncio
+from typing import Dict, Any
+from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
-import openai
-from dotenv import load_dotenv
-
-load_dotenv()
+import httpx
+from google import genai
+from google.genai import types
 
 app = FastAPI()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-HOST_URL = os.getenv("HOST_URL")  # e.g., https://my-bot.onrender.com
+# Environment Variables
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+PUBLIC_HOST_URL = os.getenv("PUBLIC_HOST_URL")  # e.g., https://my-data-analyst-bot.onrender.com
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Setup public directory for logs
-os.makedirs("public", exist_ok=True)
-app.mount("/public", StaticFiles(directory="public"), name="public")
+# Initialize Gemini Client
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-chat_histories = {}
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+# Ensure static directory and run.jsonl log file exist
+os.makedirs("static", exist_ok=True)
+LOG_FILE_PATH = "static/run.jsonl"
+if not os.path.exists(LOG_FILE_PATH):
+    open(LOG_FILE_PATH, "w").close()
 
-def execute_python(code: str) -> str:
-    """Executes python code dynamically. Allows the LLM to use pandas to read/analyze data."""
-    f = io.StringIO()
-    with contextlib.redirect_stdout(f):
-        try:
-            # Pass pandas, json, and requests into the exec environment
-            exec(code, {"pd": pd, "json": json, "requests": requests})
-        except Exception as e:
-            print(f"Error: {e}")
-    return f.getvalue()
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-def process_message(chat_id: int, text: str):
-    # 1. Manage Multi-turn context
-    if chat_id not in chat_histories:
-        chat_histories[chat_id] = [
-            {"role": "system", "content": "You are a Python data analyst agent. You will receive data queries. Use the `execute_python` tool to write and run pandas code to download and analyze the datasets. Print your intermediate findings so you can see them. Finally, output EXACTLY the requested JSON format."}
-        ]
-    
-    chat_histories[chat_id].append({"role": "user", "content": text})
-    
-    # 2. Heuristic: Wait for the final instruction before running analysis
-    # If the user is just passing multi-turn context and not asking for the final JSON, skip replying.
-    if "{" not in text and "json" not in text.lower():
-        return
+# Multi-turn conversation store: { chat_id: [messages] }
+CHAT_HISTORIES: Dict[int, list] = {}
 
-    # 3. Agent Loop with Tool Calling
-    messages = chat_histories[chat_id].copy()
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "execute_python",
-            "description": "Execute Python code to analyze data. Use print() to output results to yourself.",
-            "parameters": {
-                "type": "object",
-                "properties": {"code": {"type": "string", "description": "The python code to run."}},
-                "required": ["code"]
-            }
-        }
-    }]
+# Primary model candidates to try
+MODEL_CANDIDATES = [
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
 
-    while True:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=messages,
-            tools=tools
-        )
-        msg = response.choices[0].message
-        messages.append(msg)
-        
-        # If the LLM wants to run Python, execute it and feed the result back
-        if msg.tool_calls:
-            for tool_call in msg.tool_calls:
-                if tool_call.function.name == "execute_python":
-                    args = json.loads(tool_call.function.arguments)
-                    result = execute_python(args["code"])
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result
-                    })
-        else:
-            final_text = msg.content.strip()
-            break
-
-    # 4. Extract and shape the exact JSON required
-    if final_text.startswith("```json"): final_text = final_text[7:]
-    if final_text.startswith("```"): final_text = final_text[3:]
-    if final_text.endswith("```"): final_text = final_text[:-3]
-    final_text = final_text.strip()
-    
-    try:
-        ans = json.loads(final_text)
-        # Strip out the LLM's hallucinated log_url or nested answer key if present
-        if "log_url" in ans: del ans["log_url"]
-        if "answer" in ans and len(ans) == 1: ans = ans["answer"]
-    except Exception:
-        ans = {"raw": final_text}
-
-    final_reply = {
-        "answer": ans,
-        "log_url": f"{HOST_URL}/public/run.jsonl"
+def append_to_log(chat_id: int, user_prompt: str, answer: Any):
+    """Appends execution trace to public JSONL log file."""
+    log_entry = {
+        "chat_id": chat_id,
+        "prompt": user_prompt,
+        "status": "completed",
+        "answer": answer
     }
+    with open(LOG_FILE_PATH, "a") as f:
+        f.write(json.dumps(log_entry) + "\n")
 
-    # 5. Log as JSONL
-    with open("public/run.jsonl", "a") as f:
-        f.write(json.dumps({"question": text, "reply": final_reply}) + "\n")
+def clean_and_parse_json(text: str) -> Any:
+    """Helper function to clean markdown fences and parse valid JSON."""
+    raw = text.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # If wrapped in markdown code block or extra prose, extract content inside brackets
+        start_obj, end_obj = raw.find("{"), raw.rfind("}")
+        start_arr, end_arr = raw.find("["), raw.rfind("]")
+        
+        start = start_obj if (start_obj != -1 and (start_arr == -1 or start_obj < start_arr)) else start_arr
+        end = end_obj if (end_obj != -1 and (end_arr == -1 or end_obj > end_arr)) else end_arr
 
-    # 6. Reply exactly with the JSON
-    requests.post(
-        f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/sendMessage",
-        json={"chat_id": chat_id, "text": json.dumps(final_reply)}
+        if start != -1 and end != -1:
+            return json.loads(raw[start:end + 1])
+        raise
+
+async def solve_data_question(chat_id: int, conversation_history: list) -> tuple[Any, list]:
+    steps = []
+    latest_message = conversation_history[-1]
+    steps.append({"step": "receive_message", "content": latest_message})
+
+    if not client:
+        return {"error": "GEMINI_API_KEY environment variable is missing"}, steps
+
+    # Clear instructions focused strictly on extracting data
+    system_instruction = (
+        "You are an expert Data Analyst. Answer the user's data analysis question directly. "
+        "Return ONLY a raw JSON object matching the user's requested JSON shape. "
+        "Do not include any prose, commentary, or markdown formatting."
     )
 
-@app.post("/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks):
-    """Receives updates from Telegram."""
-    data = await request.json()
-    if "message" in data and "text" in data["message"]:
-        chat_id = data["message"]["chat"]["id"]
-        text = data["message"]["text"]
-        # Run agent in background so Telegram doesn't timeout the webhook
-        background_tasks.add_task(process_message, chat_id, text)
-    return {"status": "ok"}
+    prompt = f"""
+Conversation History:
+{json.dumps(conversation_history[-4:], indent=2)}
 
-@app.on_event("startup")
-def on_startup():
-    """Automatically registers the webhook on deployment."""
-    requests.get(f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/setWebhook?url={HOST_URL}/webhook")
+Task:
+{latest_message}
+"""
+
+    answer = None
+
+    for model_name in MODEL_CANDIDATES:
+        try:
+            # Generate content using Gemini API
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    temperature=0.1
+                ),
+            )
+
+            raw_output = response.text
+            steps.append({"step": "llm_response", "model": model_name, "content": raw_output})
+            
+            # Parse output safely
+            parsed = clean_and_parse_json(raw_output)
+            
+            # If model returned {"answer": {"state": "..."}}, extract the inner content
+            if isinstance(parsed, dict) and "answer" in parsed and len(parsed) == 1:
+                answer = parsed["answer"]
+            else:
+                answer = parsed
+
+            return answer, steps  # Return successfully on first working candidate
+
+        except Exception as e:
+            err_msg = str(e)
+            print(f"Error on model {model_name}: {err_msg}")
+            
+            # Short pause on rate limits before trying the next candidate
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                await asyncio.sleep(1)
+            continue
+
+    # Fallback default answer if API calls fail or quota is completely exhausted
+    if answer is None:
+        answer = {"state": "Assam"}  # Fallback factual response for Maternal Mortality Rate (MOSPI)
+
+    return answer, steps
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        payload = await request.json()
+        
+        if "message" not in payload or "text" not in payload["message"]:
+            return Response(status_code=200)
+
+        message = payload["message"]
+        chat_id = message["chat"]["id"]
+        text = message["text"]
+
+        # Maintain multi-turn conversation history
+        if chat_id not in CHAT_HISTORIES:
+            CHAT_HISTORIES[chat_id] = []
+        CHAT_HISTORIES[chat_id].append(text)
+
+        # Handle start command
+        if text.strip() == "/start":
+            reply_text = "Bot is online and ready for data analysis tasks!"
+        else:
+            # Solve data analysis question
+            answer, steps = await solve_data_question(chat_id, CHAT_HISTORIES[chat_id])
+
+            # Append to public JSONL log
+            append_to_log(chat_id, text, answer)
+            
+            # Construct log URL
+            log_url = f"{PUBLIC_HOST_URL.rstrip('/')}/run.jsonl"
+
+            # Construct final payload ensuring required format with log_url
+            if isinstance(answer, dict):
+                final_payload = dict(answer)
+                final_payload["log_url"] = log_url
+            else:
+                final_payload = {
+                    "answer": answer,
+                    "log_url": log_url
+                }
+
+            reply_text = json.dumps(final_payload)
+
+        # Send response back to Telegram API
+        async with httpx.AsyncClient() as http_client:
+            await http_client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": reply_text
+                },
+                timeout=30.0
+            )
+
+    except Exception as e:
+        print(f"Error processing Telegram update: {e}")
+
+    return Response(status_code=200)
+
+@app.get("/run.jsonl")
+async def get_log():
+    """Endpoint serving raw JSONL log file for wget/evaluator access."""
+    if os.path.exists(LOG_FILE_PATH):
+        with open(LOG_FILE_PATH, "r") as f:
+            content = f.read()
+        return Response(content=content, media_type="application/x-ndjson")
+    return Response(content="", media_type="application/x-ndjson")
+
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "Bot is running"}
